@@ -1,0 +1,13 @@
+{
+  "name": "Lettore — leggi ad alta voce PDF e DOCX",
+  "short_name": "Lettore",
+  "description": "Legge ad alta voce PDF, DOCX e TXT in italiano, frase per frase, con segnalibro automatico.",
+  "lang": "it",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#F6F4EE",
+  "theme_color": "#2E6E5E",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
