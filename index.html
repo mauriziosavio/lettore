@@ -687,25 +687,37 @@ window.addEventListener("scroll",()=>{
 },{passive:true});
 
 /* ============================== audio di servizio + mediaSession ============================== */
-/* Un audio silenzioso in loop tiene viva la scheda quando lo schermo è spento
-   e fa comparire i controlli di riproduzione nella schermata di blocco. */
+/* Un audio quasi silenzioso in loop tiene viva la scheda quando lo schermo è spento
+   e fa comparire i controlli di riproduzione nella schermata di blocco.
+   NON deve essere silenzio perfetto: Chrome misura l'energia del segnale e congela
+   le schede "non udibili" in background — un fruscio a ~-58 dB (impercettibile)
+   mantiene la scheda classificata come udibile. */
 const silent=(function(){
-  const sr=8000,n=sr; // 1 secondo di silenzio
+  const sr=8000,n=sr; // 1 secondo di quasi-silenzio
   const buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
   const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
   w(0,"RIFF");v.setUint32(4,36+n*2,true);w(8,"WAVE");w(12,"fmt ");
   v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
   v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
   w(36,"data");v.setUint32(40,n*2,true);
+  let s=1;
+  for(let i=0;i<n;i++){s=(s*16807)%2147483647;v.setInt16(44+i*2,(s%81)-40,true);}
   const a=document.createElement("audio");
   a.src=URL.createObjectURL(new Blob([buf],{type:"audio/wav"}));
-  a.loop=true; a.volume=0.06; a.setAttribute("playsinline","");
+  a.loop=true; a.volume=1; a.setAttribute("playsinline","");
   return a;
 })();
+/* Un Web Lock attivo è un ulteriore segnale che impedisce a Chrome di ibernare la pagina. */
+let ttsLockRelease=null;
+function holdTtsLock(){
+  if(!("locks" in navigator)||ttsLockRelease)return;
+  try{navigator.locks.request("lettore-lettura",()=>new Promise(res=>{ttsLockRelease=res;})).catch(()=>{});}catch(e){}
+}
+function dropTtsLock(){ if(ttsLockRelease){ttsLockRelease();ttsLockRelease=null;} }
 function setPlaying(on){
   playing=on; updatePlayBtn();
-  if(on){requestWake(); silent.play().catch(()=>{});}
-  else{releaseWake(); silent.pause();}
+  if(on){requestWake(); holdTtsLock(); silent.play().catch(()=>{});}
+  else{releaseWake(); dropTtsLock(); silent.pause();}
   if("mediaSession" in navigator)navigator.mediaSession.playbackState=on?"playing":"paused";
 }
 if("mediaSession" in navigator){
