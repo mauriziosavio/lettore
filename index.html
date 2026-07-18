@@ -190,7 +190,7 @@
 </style>
 
 <header>
-  <div class="wordmark">Lettore<em>.</em><span class="ver">18.07.1</span></div>
+  <div class="wordmark">Lettore<em>.</em><span class="ver">18.07.2</span></div>
   <div id="bookTitle"></div>
   <button id="openBtn" type="button">Apri file</button>
 </header>
@@ -311,6 +311,13 @@ const WORKER_B64="LyoqCiAqIEBsaWNzdGFydCBUaGUgZm9sbG93aW5nIGlzIHRoZSBlbnRpcmUgbG
 })();
 
 const $=id=>document.getElementById(id);
+
+/* ---- ambiente nativo (APK Capacitor): voce Android al posto della Web Speech API ---- */
+const CAP=(window.Capacitor&&window.Capacitor.isNativePlatform&&window.Capacitor.isNativePlatform())?window.Capacitor.Plugins:null;
+if(!window.speechSynthesis){ /* il WebView Android non ha speechSynthesis: finto innocuo */
+  window.SpeechSynthesisUtterance=function(t){this.text=t;};
+  window.speechSynthesis={getVoices:()=>[],speak:()=>{},cancel:()=>{},resume:()=>{},pause:()=>{},speaking:false,pending:false,paused:false,onvoiceschanged:null};
+}
 const landing=$("landing"), busy=$("busy"), busyMsg=$("busyMsg"), reader=$("reader"),
       player=$("player"), bookTitle=$("bookTitle"),
       barEl=$("bar"), barFill=$("barFill"), barKnob=$("barKnob"),
@@ -371,6 +378,10 @@ function refreshVoices(){
 }
 speechSynthesis.onvoiceschanged=refreshVoices;
 refreshVoices();
+if(CAP){ /* nell'APK la voce è quella di sistema Android: niente elenco voci web */
+  voiceSel.style.display="none";
+  const ve=document.querySelector(".wordmark .ver"); if(ve)ve.textContent+="·app";
+}
 // su iPhone/iPad l'elenco voci arriva in ritardo: riprova per qualche secondo
 (function pollVoices(n){
   if(voices.length||n<=0)return;
@@ -740,7 +751,9 @@ function holdTtsLock(){
 function dropTtsLock(){ if(ttsLockRelease){ttsLockRelease();ttsLockRelease=null;} }
 function setPlaying(on){
   playing=on; updatePlayBtn();
-  if(on){requestWake(); holdTtsLock(); silent.play().catch(()=>{}); startAc();}
+  if(CAP){ /* nell'APK ci pensa il servizio in primo piano; lo schermo può spegnersi */
+    try{if(on)CAP.LetturaService.start();else CAP.LetturaService.stop();}catch(e){}
+  }else if(on){requestWake(); holdTtsLock(); silent.play().catch(()=>{}); startAc();}
   else{releaseWake(); dropTtsLock(); silent.pause(); stopAc();}
   if("mediaSession" in navigator)navigator.mediaSession.playbackState=on?"playing":"paused";
 }
@@ -764,6 +777,7 @@ function pauseAfter(t,cur,next){
 function stopSpeech(){
   seq++;
   clearTimeout(watchdog);
+  if(CAP){try{CAP.TextToSpeech.stop();}catch(e){}}
   speechSynthesis.cancel();
 }
 function speak(i){
@@ -772,10 +786,6 @@ function speak(i){
   const s=sents[i];
   if(!s){setPlaying(false);toast("Fine del libro. Bella lettura!");return;}
   setIndex(i);
-  const u=new SpeechSynthesisUtterance(s.t);
-  u.lang="it-IT"; u.rate=rate;
-  const v=voices[+voiceSel.value];
-  if(v){u.voice=v;u.lang=v.lang;}
   const advance=()=>{
     if(my!==seq||!playing)return;
     clearTimeout(watchdog);
@@ -784,6 +794,35 @@ function speak(i){
     if(document.hidden){if(my===seq&&playing)speak(i+1);return;}
     setTimeout(()=>{if(my===seq&&playing)speak(i+1);},pauseAfter(s.t,s,sents[i+1]));
   };
+  if(CAP){
+    /* Voce nativa Android: con il servizio in primo piano attivo continua
+       anche a schermo spento o con un'altra app davanti. */
+    const estN=(s.t.length/10)*(1000/rate)+9000;
+    watchdog=setTimeout(()=>{
+      if(my===seq&&playing){
+        try{CAP.TextToSpeech.stop();}catch(e){}
+        seq++;const nv=seq;
+        setTimeout(()=>{if(playing&&nv===seq)speak(i+1);},150);
+      }
+    },estN);
+    CAP.TextToSpeech.speak({text:s.t,lang:"it-IT",rate:rate,queueStrategy:0})
+      .then(()=>{if(my!==seq)return;errStreak=0;killStreak=0;advance();})
+      .catch(()=>{
+        if(my!==seq)return; // interrotta da un nostro stop: ignora
+        clearTimeout(watchdog);
+        if(++errStreak>=3){
+          errStreak=0; setPlaying(false); stopSpeech(); setIndex(i);
+          toast("La voce non riesce a partire. Tocca di nuovo ▶; se non senti nulla, controlla il volume.",6000);
+          return;
+        }
+        setTimeout(()=>{if(my===seq&&playing)speak(i);},500);
+      });
+    return;
+  }
+  const u=new SpeechSynthesisUtterance(s.t);
+  u.lang="it-IT"; u.rate=rate;
+  const v=voices[+voiceSel.value];
+  if(v){u.voice=v;u.lang=v.lang;}
   u.onstart=()=>{if(my===seq){errStreak=0;killStreak=0;}};
   u.onend=()=>{errStreak=0;killStreak=0;advance();};
   u.onerror=e=>{
@@ -837,6 +876,7 @@ function releaseWake(){
   try{if(wakeLock){wakeLock.release();wakeLock=null;}}catch(e){}
 }
 document.addEventListener("visibilitychange",()=>{
+  if(CAP)return; // nell'APK la voce nativa non muore in background
   if(document.visibilityState==="visible"&&playing){
     requestWake();
     try{speechSynthesis.resume();}catch(e){}
@@ -846,7 +886,7 @@ document.addEventListener("visibilitychange",()=>{
 });
 // Chrome a volte resta bloccato in "paused" dopo lo spegnimento dello schermo: resume periodico innocuo
 setInterval(()=>{
-  if(playing){
+  if(playing&&!CAP){
     try{speechSynthesis.resume();}catch(e){}
     if(ac&&ac.state!=="running")ac.resume().catch(()=>{});
     if(silent.paused)silent.play().catch(()=>{});
