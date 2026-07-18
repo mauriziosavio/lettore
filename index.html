@@ -53,6 +53,7 @@
     font-weight:700; font-size:1.05rem; letter-spacing:.01em; white-space:nowrap;
   }
   .wordmark em{font-style:normal;color:var(--accent)}
+  .wordmark .ver{font-size:.58rem;font-weight:400;color:var(--muted);margin-left:7px;letter-spacing:.4px;vertical-align:2px}
   #bookTitle{
     flex:1; min-width:0; text-align:center;
     font-size:.82rem; color:var(--muted);
@@ -189,7 +190,7 @@
 </style>
 
 <header>
-  <div class="wordmark">Lettore<em>.</em></div>
+  <div class="wordmark">Lettore<em>.</em><span class="ver">18.07.1</span></div>
   <div id="bookTitle"></div>
   <button id="openBtn" type="button">Apri file</button>
 </header>
@@ -320,7 +321,7 @@ const landing=$("landing"), busy=$("busy"), busyMsg=$("busyMsg"), reader=$("read
 let book=null;          // {key,name,pars:[{text,page}],numPages}
 let sents=[];           // {t,par,page}
 let spans=[];           // span elements, aligned with sents
-let idx=0, playing=false, seq=0, watchdog=null, errStreak=0;
+let idx=0, playing=false, seq=0, watchdog=null, errStreak=0, killStreak=0;
 let rate=1, voiceName=null;
 let userScrolledAt=0;
 let wakeLock=null;
@@ -701,12 +702,35 @@ const silent=(function(){
   v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
   w(36,"data");v.setUint32(40,n*2,true);
   let s=1;
-  for(let i=0;i<n;i++){s=(s*16807)%2147483647;v.setInt16(44+i*2,(s%81)-40,true);}
+  for(let i=0;i<n;i++){s=(s*16807)%2147483647;v.setInt16(44+i*2,(s%361)-180,true);}
   const a=document.createElement("audio");
   a.src=URL.createObjectURL(new Blob([buf],{type:"audio/wav"}));
   a.loop=true; a.volume=1; a.setAttribute("playsinline","");
   return a;
 })();
+/* Secondo keep-alive: un AudioContext attivo con lo stesso fruscio. Chrome tratta
+   WebAudio e <audio> come sorgenti distinte; tenerli entrambi accesi aumenta la
+   probabilità che la scheda resti "udibile" (e i timer attivi) in background. */
+let ac=null,acSrc=null;
+function startAc(){
+  try{
+    if(!ac)ac=new (window.AudioContext||window.webkitAudioContext)();
+    ac.resume().catch(()=>{});
+    if(!acSrc){
+      const sr=ac.sampleRate,buf=ac.createBuffer(1,sr,sr),d=buf.getChannelData(0);
+      let s=1;
+      for(let i=0;i<sr;i++){s=(s*16807)%2147483647;d[i]=((s%1000)/1000-0.5)*0.011;}
+      acSrc=ac.createBufferSource();acSrc.buffer=buf;acSrc.loop=true;
+      acSrc.connect(ac.destination);acSrc.start();
+    }
+  }catch(e){}
+}
+function stopAc(){
+  try{
+    if(acSrc){acSrc.stop();acSrc.disconnect();acSrc=null;}
+    if(ac)ac.suspend().catch(()=>{});
+  }catch(e){}
+}
 /* Un Web Lock attivo è un ulteriore segnale che impedisce a Chrome di ibernare la pagina. */
 let ttsLockRelease=null;
 function holdTtsLock(){
@@ -716,8 +740,8 @@ function holdTtsLock(){
 function dropTtsLock(){ if(ttsLockRelease){ttsLockRelease();ttsLockRelease=null;} }
 function setPlaying(on){
   playing=on; updatePlayBtn();
-  if(on){requestWake(); holdTtsLock(); silent.play().catch(()=>{});}
-  else{releaseWake(); dropTtsLock(); silent.pause();}
+  if(on){requestWake(); holdTtsLock(); silent.play().catch(()=>{}); startAc();}
+  else{releaseWake(); dropTtsLock(); silent.pause(); stopAc();}
   if("mediaSession" in navigator)navigator.mediaSession.playbackState=on?"playing":"paused";
 }
 if("mediaSession" in navigator){
@@ -760,11 +784,21 @@ function speak(i){
     if(document.hidden){if(my===seq&&playing)speak(i+1);return;}
     setTimeout(()=>{if(my===seq&&playing)speak(i+1);},pauseAfter(s.t,s,sents[i+1]));
   };
-  u.onstart=()=>{if(my===seq)errStreak=0;};
-  u.onend=()=>{errStreak=0;advance();};
+  u.onstart=()=>{if(my===seq){errStreak=0;killStreak=0;}};
+  u.onend=()=>{errStreak=0;killStreak=0;advance();};
   u.onerror=e=>{
     if(my!==seq)return;
-    if(e.error==="interrupted"||e.error==="canceled")return;
+    if(e.error==="interrupted"||e.error==="canceled"){
+      /* Interruzione NON nostra: i nostri cancel incrementano seq prima, quindi
+         qui è Android che ha ucciso la voce (tipico al passaggio in background).
+         Non fermare la lettura: riprova la stessa frase con attese crescenti,
+         così appena il motore torna disponibile la lettura riprende da sola. */
+      if(!playing)return;
+      clearTimeout(watchdog);
+      const wait=Math.min(400*Math.pow(2,killStreak++),5000);
+      setTimeout(()=>{if(my===seq&&playing)speak(i);},wait);
+      return;
+    }
     // se la voce non parte mai (audio bloccato, motore assente) non sfogliare il libro in silenzio
     if(++errStreak>=3){
       errStreak=0; setPlaying(false); stopSpeech(); setIndex(i);
@@ -775,7 +809,13 @@ function speak(i){
   };
   // watchdog: se il motore TTS si blocca, passa oltre
   const est=(s.t.length/10)*(1000/rate)+7000;
-  watchdog=setTimeout(()=>{if(my===seq&&playing){speechSynthesis.cancel();seq++;const nv=seq;setTimeout(()=>{if(playing&&nv===seq)speak(i+1);},100);}},est);
+  watchdog=setTimeout(()=>{
+    if(my===seq&&playing){
+      seq++;const nv=seq;speechSynthesis.cancel();
+      const t=document.hidden?i:i+1; // in background non saltare frasi: si sfoglierebbe il libro in silenzio
+      setTimeout(()=>{if(playing&&nv===seq)speak(t);},100);
+    }
+  },est);
   const go=()=>{
     if(my!==seq)return;
     try{speechSynthesis.speak(u);speechSynthesis.resume();}catch(e){}
@@ -797,10 +837,21 @@ function releaseWake(){
   try{if(wakeLock){wakeLock.release();wakeLock=null;}}catch(e){}
 }
 document.addEventListener("visibilitychange",()=>{
-  if(document.visibilityState==="visible"&&playing){requestWake();try{speechSynthesis.resume();}catch(e){}}
+  if(document.visibilityState==="visible"&&playing){
+    requestWake();
+    try{speechSynthesis.resume();}catch(e){}
+    // se la voce è stata uccisa mentre l'app era in background, riparti dalla frase corrente
+    setTimeout(()=>{if(playing&&!speechSynthesis.speaking&&!speechSynthesis.pending)speak(idx);},350);
+  }
 });
 // Chrome a volte resta bloccato in "paused" dopo lo spegnimento dello schermo: resume periodico innocuo
-setInterval(()=>{if(playing){try{speechSynthesis.resume();}catch(e){}}},8000);
+setInterval(()=>{
+  if(playing){
+    try{speechSynthesis.resume();}catch(e){}
+    if(ac&&ac.state!=="running")ac.resume().catch(()=>{});
+    if(silent.paused)silent.play().catch(()=>{});
+  }
+},8000);
 
 playBtn.addEventListener("click",()=>{
   if(playing){setPlaying(false);stopSpeech();}
